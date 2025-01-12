@@ -1,46 +1,127 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from braindecode.datasets.moabb import MOABBDataset
+from braindecode.preprocessing import preprocess, Preprocessor
+from braindecode.preprocessing.windowers import create_windows_from_events
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+import numpy as np
 
-# Import useful packages
-import tensorflow as tf
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Load and preprocess EEG dataset
+def load_and_preprocess_data():
+    dataset = MOABBDataset(dataset_name="BNCI2014001", subject_ids=[1])  # Motor Imagery dataset (Competition IV 2a)
 
-def LSTM(Input, max_time, n_input, lstm_size, keep_prob, weights_1, biases_1, weights_2, biases_2):
-    '''
+    # Preprocess: band-pass filter, standardization
+    preprocessors = [
+        Preprocessor("filterbank", freq_bands=[(4, 40)]),  # Band-pass filter 4-40Hz
+        Preprocessor("zscore")  # Standardization
+    ]
+    preprocess(dataset, preprocessors)
 
-    Args:
-        Input: The reshaped input EEG signals
-        max_time: The unfolded time slice of LSTM Model
-        n_input: The input signal size at one time
-        rnn_size: The number of LSTM units inside the LSTM Model
-        keep_prob: The Keep probability of Dropout
-        weights_1: The Weights of first fully-connected layer
-        biases_1: The biases of first fully-connected layer
-        weights_2: The Weights of second fully-connected layer
-        biases_2: The biases of second fully-connected layer
+    # Create epochs and split dataset
+    windows_dataset = create_windows_from_events(dataset, trial_start_offset_samples=0, trial_stop_offset_samples=0)
+    X, y = [], []
+    for window in windows_dataset:
+        X.append(window[0])
+        y.append(window[1])
 
-    Returns:
-        FC_2: Final prediction of LSTM Model
-        FC_1: Extracted features from the first fully connected layer
+    # Convert to numpy arrays and split into train-test sets
+    X = np.array(X)
+    y = np.array(y)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    '''
+    return X_train, X_test, y_train, y_test
 
-    # One layer RNN Model
-    Input = tf.reshape(Input, [-1, max_time, n_input])
-    cell_encoder = tf.contrib.rnn.BasicLSTMCell(num_units=lstm_size)
-    encoder_drop = tf.contrib.rnn.DropoutWrapper(cell=cell_encoder, input_keep_prob=keep_prob)
-    outputs_encoder, final_state_encoder = tf.nn.dynamic_rnn(cell=encoder_drop, inputs=Input, dtype=tf.float32)
+# Define xLSTM model
+class xLSTM(nn.Module):
+    def __init__(self, input_size, lstm_size, num_classes):
+        super(xLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_size, lstm_size, batch_first=True)
+        self.fc1 = nn.Linear(lstm_size, lstm_size // 2)
+        self.fc2 = nn.Linear(lstm_size // 2, num_classes)
+        self.dropout = nn.Dropout(0.5)
+        self.batch_norm = nn.BatchNorm1d(lstm_size // 2)
 
-    # First fully-connected layer
-    # final_state_encoder[0] is the long-term memory
-    FC_1 = tf.matmul(final_state_encoder[0], weights_1) + biases_1
-    FC_1 = tf.layers.batch_normalization(FC_1, training=True)
-    FC_1 = tf.nn.softplus(FC_1)
-    FC_1 = tf.nn.dropout(FC_1, keep_prob)
+    def forward(self, x):
+        x, _ = self.lstm(x)
+        x = x[:, -1, :]  # Take the last time step
+        x = self.fc1(x)
+        x = self.batch_norm(x)
+        x = torch.nn.functional.softplus(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return torch.nn.functional.softmax(x, dim=1)
 
-    # Second fully-connected layer
-    FC_2 = tf.matmul(FC_1, weights_2) + biases_2
-    FC_2 = tf.nn.softmax(FC_2)
+# Define training and evaluation functions
+def train_model(model, dataloader, optimizer, criterion, num_epochs=20):
+    model.train()
+    for epoch in range(num_epochs):
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
 
-    return FC_2, FC_1
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
 
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}")
+
+def evaluate_model(model, dataloader):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    accuracy = accuracy_score(all_labels, all_preds)
+    return accuracy
+
+# Main script
+if __name__ == "__main__":
+    # Load and preprocess data
+    X_train, X_test, y_train, y_test = load_and_preprocess_data()
+    input_size = X_train.shape[2]
+    num_classes = len(np.unique(y_train))
+
+    # Convert data to PyTorch tensors
+    train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
+    test_dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long))
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+    # Initialize models
+    models = {
+        "xLSTM": xLSTM(input_size, lstm_size=128, num_classes=num_classes).to(device),
+        "LSTM": nn.LSTM(input_size, 128, batch_first=True).to(device),
+        "BiLSTM": nn.LSTM(input_size, 128, batch_first=True, bidirectional=True).to(device)
+    }
+
+    results = {}
+    for model_name, model in models.items():
+        print(f"Training {model_name}...")
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+        train_model(model, train_loader, optimizer, criterion, num_epochs=20)
+
+        print(f"Evaluating {model_name}...")
+        accuracy = evaluate_model(model, test_loader)
+        results[model_name] = accuracy
+        print(f"{model_name} Accuracy: {accuracy:.4f}")
+
+    # Print results
+    print("\nPerformance Comparison:")
+    for model_name, accuracy in results.items():
+        print(f"{model_name}: {accuracy:.4f}")
